@@ -1,0 +1,1123 @@
+#!/usr/bin/env python3# -*- coding: utf-8 -*-
+"""
+================================================================================
+NEXUS GITHUB ANALYZER PRO v4.0.1 — Mode Protocole Senior (CORRIGÉ)
+================================================================================
+Auteur : Aissa Mohammedi (DGK)
+Protocole : Code Nametron 3 Lara / ZTMESH v1.5.15
+Version : 4.0.1
+Description : Analyse complète d'un dépôt GitHub (agent Slack/eve).
+Lancement localhost automatique, port dynamique, 12 checks.
+Zéro dépendance externe. Compatible a-Shell, iSH, Linux.
+
+Corrections v4.0.1 :
+- HTML réparé (template cassé)
+- webbrowser importé correctement
+- esc() défini avant usage
+- document.getElementById corrigé
+- Tous les bugs de syntaxe HTML/JS corrigés
+================================================================================
+"""
+
+import os
+import sys
+import json
+import re
+import time
+import socket
+import hashlib
+import threading
+import urllib.request
+import urllib.error
+import urllib.parse
+import webbrowser
+from datetime import datetime, timezone
+from pathlib import Path
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SECTION 1 — CONFIGURATION GLOBALE
+# ═══════════════════════════════════════════════════════════════════════════
+
+VERSION = "4.0.1"
+AUTHOR = "Aissa Mohammedi (DGK)"
+PROTOCOLE = "Code Nametron 3 Lara / ZTMESH v1.5.15"
+BUILD_DATE = "2026-10-11"
+
+HOME = Path.home()
+NEXUS_DIR = HOME / "Documents" / "nexus_analyzer"
+REPORTS_DIR = NEXUS_DIR / "reports"
+CACHE_DIR = NEXUS_DIR / "cache"
+LOGS_DIR = NEXUS_DIR / "logs"
+
+for _d in (NEXUS_DIR, REPORTS_DIR, CACHE_DIR, LOGS_DIR):
+try:
+_d.mkdir(parents=True, exist_ok=True)
+except Exception as _e:
+print(f"[WARN] Impossible de créer {_d} : {_e}")
+
+DEFAULT_PORT = 8080
+MAX_PORT_SCAN = 20
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SECTION 2 — COULEURS ANSI
+# ═══════════════════════════════════════════════════════════════════════════
+
+class C:
+G = '\033[92m'; R = '\033[91m'; Y = '\033[93m'; B = '\033[94m'
+M = '\033[95m'; CY = '\033[96m'; W = '\033[1m'; D = '\033[2m'; N = '\033[0m'
+
+
+def ok(msg): print(f"{C.G}[OK]{C.N} {msg}")
+def err(msg): print(f"{C.R}[X]{C.N} {msg}")
+def warn(msg): print(f"{C.Y}[!]{C.N} {msg}")
+def info(msg): print(f"{C.B}[i]{C.N} {msg}")
+
+
+def log_to_file(msg, level="INFO"):
+try:
+log_file = LOGS_DIR / f"nexus_{datetime.now().strftime('%Y%m%d')}.log"
+with open(log_file, "a", encoding="utf-8") as f:
+ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+f.write(f"[{ts}] [{level}] {msg}\n")
+except Exception:
+pass
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SECTION 3 — CLIENT GITHUB
+# ═══════════════════════════════════════════════════════════════════════════
+
+class GitHubClient:
+def __init__(self, token=None):
+self.token = token
+self.cache = {}
+self.cache_ttl = 300
+self._lock = threading.Lock()
+
+def _headers(self):
+h = {"User-Agent": f"NexusAnalyzer/{VERSION}",
+"Accept": "application/vnd.github.v3+json"}
+if self.token:
+h["Authorization"] = f"token {self.token}"
+return h
+
+def _cache_key(self, url):
+return hashlib.sha256(url.encode()).hexdigest()[:16]
+
+def _get_cache(self, url):
+key = self._cache_key(url)
+with self._lock:
+e = self.cache.get(key)
+if e and time.time() - e["time"] < self.cache_ttl:
+return e["data"]
+return None
+
+def _set_cache(self, url, data):
+key = self._cache_key(url)
+with self._lock:
+self.cache[key] = {"data": data, "time": time.time()}
+
+def api_get(self, endpoint, timeout=15):
+url = f"https://api.github.com/{endpoint.lstrip('/')}"
+c = self._get_cache(url)
+if c:
+try:
+return json.loads(c)
+except Exception:
+pass
+try:
+req = urllib.request.Request(url, headers=self._headers())
+with urllib.request.urlopen(req, timeout=timeout) as r:
+data = r.read().decode("utf-8", errors="ignore")
+self._set_cache(url, data)
+return json.loads(data)
+except urllib.error.HTTPError as e:
+if e.code == 404:
+return None
+if e.code == 403:
+return {"_rate_limited": True}
+return None
+except Exception:
+return None
+
+def raw_get(self, repo, path, branch="main", timeout=10, _rec=0):
+if _rec > 1:
+return None
+url = f"https://raw.githubusercontent.com/{repo}/{branch}/{path}"
+c = self._get_cache(url)
+if c:
+return c
+h = {"User-Agent": f"NexusAnalyzer/{VERSION}"}
+if self.token:
+h["Authorization"] = f"token {self.token}"
+try:
+req = urllib.request.Request(url, headers=h)
+with urllib.request.urlopen(req, timeout=timeout) as r:
+data = r.read().decode("utf-8", errors="ignore")
+self._set_cache(url, data)
+return data
+except Exception:
+if branch == "main":
+return self.raw_get(repo, path, "master", timeout, _rec + 1)
+return None
+
+
+def extraire_repo(url):
+if not url:
+return ""
+url = url.strip().rstrip("/")
+url = re.sub(r"\.git$", "", url)
+url = re.sub(r"^https?://github\.com/", "", url)
+url = re.sub(r"^git@github\.com:", "", url)
+url = re.sub(r"^github\.com/", "", url)
+return url.split("?")[0].split("#")[0]
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SECTION 4 — RÉSULTAT D'ANALYSE
+# ═══════════════════════════════════════════════════════════════════════════
+
+class AnalysisResult:
+def __init__(self, name, category="general"):
+self.name = name
+self.category = category
+self.checks = []
+self.fixes = []
+self.issues = []
+self.score = 0.0
+self.max_score = 0
+self._lock = threading.Lock()
+
+def add(self, status, message, severity="info", fix=None, code=None):
+with self._lock:
+self.checks.append({"status": status, "message": message, "severity": severity})
+self.max_score += 1
+if status == "ok":
+self.score += 1
+elif status == "warn":
+self.score += 0.5
+if status in ("err", "warn") and fix:
+self.fixes.append({"message": message, "fix": fix,
+"code": code or "", "severity": severity})
+if status == "err":
+self.issues.append({"level": "error", "severity": severity,
+"message": message})
+
+def to_dict(self):
+with self._lock:
+return {
+"name": self.name, "category": self.category,
+"checks": list(self.checks), "fixes": list(self.fixes),
+"issues": list(self.issues), "score": round(self.score, 1),
+"max_score": self.max_score,
+"percent": round(self.score / self.max_score * 100, 1)
+if self.max_score > 0 else 0,
+}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SECTION 5 — 12 CHECKS
+# ═══════════════════════════════════════════════════════════════════════════
+
+def check_01_info(client, repo):
+r = AnalysisResult("Informations dépôt", "meta")
+d = client.api_get(f"repos/{repo}")
+if not d:
+r.add("err", "Dépôt introuvable ou inaccessible", "critical",
+"Vérifie l'URL et tes droits d'accès")
+return r
+if d.get("_rate_limited"):
+r.add("warn", "Rate limit GitHub atteint", "medium",
+"Utilise un token GitHub avec GITHUB_TOKEN=xxx")
+return r
+r.add("ok", f"Dépôt : {d.get('full_name', 'N/A')}")
+r.add("ok", f"Description : {(d.get('description') or 'aucune')[:80]}")
+r.add("ok", f"Langage : {d.get('language', 'N/A')}")
+r.add("ok", f"Stars : {d.get('stargazers_count', 0)}")
+r.add("ok", f"Forks : {d.get('forks_count', 0)}")
+r.add("ok", f"Branche par défaut : {d.get('default_branch', 'main')}")
+if d.get("archived"):
+r.add("warn", "Dépôt archivé", "low", "Le dépôt n'est plus maintenu")
+if d.get("disabled"):
+r.add("err", "Dépôt désactivé", "high", "Réactive-le dans GitHub")
+return r
+
+
+def check_02_structure(client, repo):
+r = AnalysisResult("Structure du projet", "structure")
+contents = client.api_get(f"repos/{repo}/contents/")
+if not contents or not isinstance(contents, list):
+r.add("err", "Impossible de lister le contenu", "high",
+"Vérifie tes droits d'accès")
+return r
+files = [x.get("name", "") for x in contents]
+for f, desc in {"package.json": "Package Node.js",
+"README.md": "Documentation",
+"tsconfig.json": "Config TypeScript",
+".gitignore": "Git ignore"}.items():
+if f in files:
+r.add("ok", f"{desc} : {f}")
+else:
+r.add("warn", f"{desc} manquant : {f}", "medium",
+f"Crée {f}", f"touch {f}")
+for d, desc in {"agent": "Dossier eve agent", "channels": "Dossier channels",
+"tools": "Dossier tools", "src": "Dossier source",
+"app": "Dossier Next.js"}.items():
+if d in files:
+r.add("ok", f"{desc} : {d}/")
+return r
+
+
+def check_03_lockfile(client, repo):
+r = AnalysisResult("Lockfile & Dépendances", "deps")
+pkg = client.raw_get(repo, "package.json")
+pnpm = client.raw_get(repo, "pnpm-lock.yaml")
+npm = client.raw_get(repo, "package-lock.json")
+yarn = client.raw_get(repo, "yarn.lock")
+if not pkg:
+r.add("err", "package.json introuvable", "critical",
+"Ajoute package.json à la racine")
+return r
+r.add("ok", "package.json trouvé")
+lock = pnpm or npm or yarn
+if not lock:
+r.add("err", "Aucun lockfile trouvé", "critical",
+"Exécute pnpm install", "pnpm install")
+return r
+if pnpm:
+r.add("ok", "Lockfile pnpm trouvé")
+lt = "pnpm"
+elif npm:
+r.add("ok", "Lockfile npm trouvé")
+lt = "npm"
+else:
+r.add("ok", "Lockfile yarn trouvé")
+lt = "yarn"
+try:
+p = json.loads(pkg)
+except json.JSONDecodeError as e:
+r.add("err", f"package.json invalide : {e}", "critical",
+"Corrige la syntaxe JSON")
+return r
+deps = {}
+for k in ("dependencies", "devDependencies", "peerDependencies", "optionalDependencies"):
+deps.update(p.get(k, {}))
+if not deps:
+r.add("warn", "Aucune dépendance déclarée", "low")
+return r
+r.add("ok", f"{len(deps)} dépendances déclarées")
+if lt == "pnpm":
+mm = []
+for name in deps.keys():
+if not (f"/{name}@" in lock or f"'{name}':" in lock or
+f'"{name}":' in lock or f"\n {name}:" in lock):
+mm.append(name)
+if mm:
+r.add("err", f"⚠️ {len(mm)} dépendance(s) manquante(s) dans pnpm-lock.yaml",
+"critical",
+"Cause probable de ERR_PNPM_OUTDATED_LOCKFILE sur Vercel !",
+"rm pnpm-lock.yaml && pnpm install && git add pnpm-lock.yaml && git commit -m 'fix: sync lockfile' && git push")
+for m in mm[:8]:
+r.add("info", f" → {m}")
+return r
+
+
+def check_04_engines(client, repo):
+r = AnalysisResult("Node.js Engines", "runtime")
+pkg = client.raw_get(repo, "package.json")
+if not pkg:
+r.add("warn", "package.json introuvable", "medium")
+return r
+try:
+p = json.loads(pkg)
+except Exception:
+r.add("err", "package.json invalide", "critical")
+return r
+eng = p.get("engines", {})
+if not eng:
+r.add("warn", "Pas de champ engines", "high",
+'Ajoute engines node >= 24',
+'"engines": { "node": ">=24.0.0" }')
+return r
+r.add("ok", f"Engines : {json.dumps(eng)}")
+n = eng.get("node", "")
+if ">=24" in n or ">24" in n:
+r.add("ok", "Node.js >= 24 (requis pour eve)")
+elif n:
+r.add("warn", f"Node {n} (eve requiert >=24)", "high",
+'Change node >= 24', '"node": ">=24.0.0"')
+return r
+
+
+def check_05_env(client, repo):
+r = AnalysisResult("Variables d'environnement", "config")
+env = (client.raw_get(repo, ".env.example") or
+client.raw_get(repo, ".env.sample"))
+if not env:
+r.add("warn", "Pas de .env.example", "high",
+"Crée .env.example", "touch .env.example")
+return r
+r.add("ok", ".env.example trouvé")
+for v in ["SLACK_CONNECTOR", "AI_GATEWAY_API_KEY", "BETTER_AUTH_SECRET",
+"VERCEL_OIDC_TOKEN", "SLACK_BOT_TOKEN", "OPENAI_API_KEY"]:
+if v in env:
+r.add("ok", f"Variable : {v}")
+if client.raw_get(repo, ".env"):
+r.add("err", "🚨 .env committé ! SECRETS EXPOSÉS", "critical",
+"Retire .env du repo immédiatement",
+"git rm --cached .env && echo .env >> .gitignore")
+gi = client.raw_get(repo, ".gitignore")
+if gi and ".env" not in gi:
+r.add("warn", ".env non ignoré", "high",
+"Ajoute .env à .gitignore", "echo .env >> .gitignore")
+return r
+
+
+def check_06_channel(client, repo):
+r = AnalysisResult("Eve Slack Channel", "eve")
+ch = None
+fp = None
+for p in ["agent/channels/slack.ts", "agent/channels/slack.js",
+"channels/slack.ts", "channels/slack.js"]:
+c = client.raw_get(repo, p)
+if c:
+ch = c
+fp = p
+break
+if not ch:
+r.add("warn", "Channel Slack introuvable", "medium",
+"Crée agent/channels/slack.ts")
+return r
+r.add("ok", f"Channel trouvé : {fp}")
+if "slackChannel" in ch:
+r.add("ok", "slackChannel() utilisé")
+else:
+r.add("err", "slackChannel() manquant", "high",
+"Import slackChannel",
+"import { slackChannel } from 'eve/channels/slack';")
+if "connectSlackCredentials" in ch:
+r.add("ok", "connectSlackCredentials() (Vercel Connect)")
+else:
+r.add("warn", "connectSlackCredentials() non détecté", "high",
+"Utilise connectSlackCredentials('slack/nom')",
+"connectSlackCredentials('slack/my-agent')")
+for h in ["onAppMention", "onDirectMessage", "onMessage"]:
+if h in ch:
+r.add("ok", f"Handler : {h}")
+if re.search(r"xox[bp]-[0-9]", ch):
+r.add("err", "🚨 Token Slack hardcodé !", "critical",
+"Retire le token du code",
+"Utilise process.env.SLACK_BOT_TOKEN")
+return r
+
+
+def check_07_instructions(client, repo):
+r = AnalysisResult("Instructions Agent", "eve")
+ins = (client.raw_get(repo, "agent/instructions.md") or
+client.raw_get(repo, "instructions.md"))
+if not ins:
+r.add("err", "instructions.md introuvable", "high",
+"Crée agent/instructions.md", "touch agent/instructions.md")
+return r
+r.add("ok", "instructions.md trouvé")
+lines = len(ins.split("\n"))
+r.add("ok", f"{lines} lignes")
+if lines < 10:
+r.add("warn", "Instructions trop courtes (<10 lignes)", "medium",
+"Ajoute rôle, capacités, règles")
+for pat, name in {
+r"identité|identity|rôle|role": "Rôle",
+r"capacit|tool": "Capacités",
+r"règle|rule|instruction": "Règles",
+r"format|style|ton": "Format"}.items():
+if re.search(pat, ins, re.IGNORECASE):
+r.add("ok", f"Section : {name}")
+else:
+r.add("warn", f"Section manquante : {name}", "low",
+f"Ajoute une section {name}")
+return r
+
+
+def check_08_tools(client, repo):
+r = AnalysisResult("Tools", "eve")
+td = client.api_get(f"repos/{repo}/contents/agent/tools")
+if not td:
+td = client.api_get(f"repos/{repo}/contents/tools")
+if not td or not isinstance(td, list):
+r.add("warn", "Aucun tool trouvé", "low",
+"Ajoute agent/tools/get_weather.ts")
+return r
+tools = [f for f in td if f.get("name", "").endswith((".ts", ".js"))]
+r.add("ok", f"{len(tools)} tool(s) trouvé(s)")
+for t in tools[:10]:
+name = t.get("name", "")
+path = t.get("path", "")
+content = client.raw_get(repo, path)
+if not content:
+continue
+if "defineTool" in content:
+r.add("ok", f"{name} : defineTool()")
+else:
+r.add("err", f"{name} : defineTool() manquant", "high",
+f"Ajoute defineTool dans {name}",
+"import { defineTool } from 'eve/tools';")
+if "export default" in content:
+r.add("ok", f"{name} : export default")
+else:
+r.add("err", f"{name} : export default manquant", "high",
+f"Ajoute export default dans {name}")
+if "inputSchema" in content or "z.object" in content:
+r.add("ok", f"{name} : schema Zod")
+else:
+r.add("warn", f"{name} : pas de schema Zod", "medium",
+f"Ajoute inputSchema: z.object({{...}})")
+return r
+
+
+def check_09_manifest(client, repo):
+r = AnalysisResult("Slack Manifest", "slack")
+m = (client.raw_get(repo, "slack/manifest.json") or
+client.raw_get(repo, "manifest.json"))
+if not m:
+r.add("warn", "Manifest non trouvé", "low",
+"Vercel Connect peut le générer automatiquement")
+return r
+r.add("ok", "Manifest trouvé")
+try:
+mj = json.loads(m)
+except Exception:
+r.add("err", "Manifest JSON invalide", "high",
+"Corrige la syntaxe JSON")
+return r
+scopes = mj.get("oauth_config", {}).get("scopes", {}).get("bot", [])
+for s in ["app_mentions:read", "chat:write", "im:history",
+"im:read", "im:write", "files:write", "channels:join",
+"reactions:read", "reactions:write"]:
+if s in scopes:
+r.add("ok", f"Scope : {s}")
+else:
+r.add("warn", f"Scope manquant : {s}", "high",
+f"Ajoute '{s}' dans les scopes bot")
+return r
+
+
+def check_10_security(client, repo):
+r = AnalysisResult("Sécurité", "security")
+patterns = {
+"Slack Bot Token": r"xoxb-[0-9]{10,}",
+"Slack App Token": r"xapp-[0-9]{10,}",
+"OpenAI Key": r"sk-[a-zA-Z0-9]{20,}",
+"Anthropic Key": r"sk-ant-[a-zA-Z0-9-]{20,}",
+"Gemini Key": r"AIza[0-9A-Za-z_\-]{35}",
+"GitHub Token": r"gh[pousr]_[A-Za-z0-9_]{36,}",
+"AWS Key": r"AKIA[0-9A-Z]{16}",
+"Private Key": r"-----BEGIN.*PRIVATE KEY-----"}
+found = 0
+for f in ["package.json", "agent/agent.ts",
+"agent/channels/slack.ts", ".env.example"]:
+c = client.raw_get(repo, f)
+if not c:
+continue
+for name, pat in patterns.items():
+if re.search(pat, c):
+r.add("err", f"🚨 Secret '{name}' dans {f}", "critical",
+"Retire et révoque immédiatement",
+"Utilise des variables d'environnement")
+found += 1
+if found == 0:
+r.add("ok", "Aucun secret hardcodé détecté")
+gi = client.raw_get(repo, ".gitignore")
+if gi:
+for pat in [".env", "node_modules", ".next", "dist", "build", "*.log"]:
+if pat in gi:
+r.add("ok", f".gitignore : {pat}")
+else:
+r.add("warn", f".gitignore manque : {pat}", "medium",
+f"Ajoute '{pat}' à .gitignore",
+f"echo '{pat}' >> .gitignore")
+else:
+r.add("warn", "Pas de .gitignore", "high", "Crée un .gitignore")
+return r
+
+
+def check_11_vercel(client, repo):
+r = AnalysisResult("Configuration Vercel", "vercel")
+vj = client.raw_get(repo, "vercel.json")
+if not vj:
+r.add("ok", "Pas de vercel.json (config par défaut)")
+else:
+r.add("ok", "vercel.json trouvé")
+try:
+v = json.loads(vj)
+if "installCommand" in v and "frozen-lockfile" in str(v.get("installCommand", "")):
+r.add("warn", "installCommand avec frozen-lockfile", "high",
+"Change en pnpm install --no-frozen-lockfile",
+'"installCommand": "pnpm install --no-frozen-lockfile"')
+except Exception:
+r.add("err", "vercel.json invalide", "high",
+"Corrige la syntaxe JSON")
+nc = (client.raw_get(repo, "next.config.ts") or
+client.raw_get(repo, "next.config.js") or
+client.raw_get(repo, "next.config.mjs"))
+if nc:
+r.add("ok", "next.config trouvé")
+if "withEve" in nc:
+r.add("ok", "withEve() utilisé")
+else:
+r.add("warn", "withEve() non utilisé", "medium",
+"Utilise withEve() pour intégrer eve",
+"import { withEve } from 'eve/next';")
+return r
+
+
+def check_12_completeness(client, repo):
+r = AnalysisResult("Complétude globale", "meta")
+fichiers = {
+"package.json": "Config Node",
+"README.md": "Documentation",
+"tsconfig.json": "Config TypeScript",
+".gitignore": "Git ignore",
+".env.example": "Env template",
+"agent/instructions.md": "Instructions agent",
+"agent/agent.ts": "Config agent",
+"agent/channels/slack.ts": "Channel Slack"}
+presents = 0
+for f, desc in fichiers.items():
+if client.raw_get(repo, f):
+r.add("ok", f"{desc} : {f}")
+presents += 1
+else:
+r.add("warn", f"Manquant : {f} ({desc})", "medium",
+f"Crée {f}")
+r.add("info", f"Complétude : {round(presents / len(fichiers) * 100, 1)}%")
+return r
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SECTION 6 — ANALYZER
+# ═══════════════════════════════════════════════════════════════════════════
+
+class NexusAnalyzer:
+def __init__(self, token=None):
+self.client = GitHubClient(token)
+self.analyzers = [
+check_01_info, check_02_structure, check_03_lockfile,
+check_04_engines, check_05_env, check_06_channel,
+check_07_instructions, check_08_tools, check_09_manifest,
+check_10_security, check_11_vercel, check_12_completeness]
+
+def analyze(self, repo, parallel=True):
+start = time.time()
+results = []
+if parallel:
+with ThreadPoolExecutor(max_workers=6) as ex:
+futures = {ex.submit(fn, self.client, repo): fn.__name__
+for fn in self.analyzers}
+for f in as_completed(futures):
+try:
+results.append(f.result())
+except Exception as e:
+r = AnalysisResult(futures[f], "error")
+r.add("err", f"Erreur interne : {e}", "high")
+results.append(r)
+else:
+for fn in self.analyzers:
+try:
+results.append(fn(self.client, repo))
+except Exception as e:
+r = AnalysisResult(fn.__name__, "error")
+r.add("err", f"Erreur interne : {e}", "high")
+results.append(r)
+duration = time.time() - start
+ordre = {fn.__name__: i for i, fn in enumerate(self.analyzers)}
+results.sort(key=lambda r: ordre.get(r.name, 99))
+total_score = sum(r.score for r in results)
+total_max = sum(r.max_score for r in results)
+percent = round(total_score / total_max * 100, 1) if total_max > 0 else 0
+all_issues = []
+all_fixes = []
+for r in results:
+all_issues.extend(r.issues)
+all_fixes.extend(r.fixes)
+return {
+"version": VERSION, "author": AUTHOR, "protocole": PROTOCOLE,
+"repo": repo,
+"timestamp": datetime.now(timezone.utc).isoformat(),
+"duration_seconds": round(duration, 2),
+"global_score": percent,
+"total_issues": len(all_issues),
+"total_fixes": len(all_fixes),
+"results": [r.to_dict() for r in results],
+"issues": all_issues, "fixes": all_fixes}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SECTION 7 — HTML TEMPLATE (CORRIGÉ)
+# ═══════════════════════════════════════════════════════════════════════════
+
+HTML_TEMPLATE = r"""<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>NEXUS GitHub Analyzer</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,system-ui,sans-serif;
+background:linear-gradient(135deg,#0a0e1a,#0f0a1e);
+color:#e8eef8;min-height:100vh;padding:20px;line-height:1.6}
+.container{max-width:1200px;margin:0 auto}
+.header{text-align:center;padding:40px 20px;
+background:linear-gradient(135deg,rgba(110,84,255,.12),rgba(56,189,248,.12));
+border-radius:20px;margin-bottom:24px;border:1px solid rgba(110,84,255,.3)}
+.header h1{font-size:2.2rem;
+background:linear-gradient(135deg,#a78bfa,#38bdf8,#f472b6);
+-webkit-background-clip:text;-webkit-text-fill-color:transparent;
+letter-spacing:2px;margin-bottom:8px}
+.header p{color:#94a3b8}
+.badge{display:inline-block;padding:4px 14px;margin-top:10px;
+background:rgba(110,84,255,.15);border:1px solid rgba(110,84,255,.4);
+border-radius:20px;font-size:.8rem;color:#a78bfa}
+.form{background:rgba(15,20,40,.85);border:1px solid rgba(110,84,255,.2);
+border-radius:16px;padding:24px;margin-bottom:24px}
+.input-row{display:flex;gap:10px;flex-wrap:wrap}
+.input-row input{flex:1;min-width:260px;padding:14px 18px;
+background:rgba(0,0,0,.4);border:1px solid rgba(110,84,255,.3);
+border-radius:10px;color:#e8eef8;font-size:.95rem;outline:none}
+.input-row input:focus{border-color:#6d54ff;
+box-shadow:0 0 15px rgba(110,84,255,.2)}
+.input-row button{padding:14px 32px;
+background:linear-gradient(135deg,#6d54ff,#38bdf8);
+border:none;border-radius:10px;color:#fff;font-size:.95rem;
+font-weight:700;cursor:pointer;letter-spacing:1px}
+.input-row button:hover{transform:translateY(-2px);
+box-shadow:0 6px 24px rgba(110,84,255,.4)}
+.input-row button:disabled{opacity:.5;cursor:not-allowed;transform:none}
+.quick{margin-top:12px;display:flex;gap:6px;flex-wrap:wrap;font-size:.8rem}
+.quick span{color:#94a3b8;align-self:center}
+.quick a{padding:4px 12px;background:rgba(56,189,248,.1);
+border:1px solid rgba(56,189,248,.3);border-radius:16px;
+color:#38bdf8;cursor:pointer;transition:.2s}
+.quick a:hover{background:rgba(56,189,248,.2)}
+.loading{display:none;padding:40px;text-align:center;
+background:rgba(15,20,40,.85);border-radius:16px;margin-bottom:24px}
+.loading.show{display:block}
+.spinner{width:50px;height:50px;margin:0 auto 20px;
+border:3px solid rgba(110,84,255,.2);border-top-color:#6d54ff;
+border-radius:50%;animation:spin 1s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+.score{display:none;padding:30px;text-align:center;
+background:linear-gradient(135deg,rgba(110,84,255,.12),rgba(56,189,248,.12));
+border-radius:20px;margin-bottom:24px;border:1px solid rgba(110,84,255,.3)}
+.score.show{display:block}
+.score-value{font-size:4rem;font-weight:900;margin-bottom:8px}
+.score-label{color:#94a3b8;text-transform:uppercase;
+letter-spacing:3px;font-size:.8rem;margin-bottom:20px}
+.score-stats{display:flex;justify-content:center;gap:30px;flex-wrap:wrap}
+.stat{text-align:center}
+.stat .n{font-size:1.8rem;font-weight:900;color:#a78bfa}
+.stat .l{font-size:.7rem;color:#94a3b8;text-transform:uppercase;
+letter-spacing:2px}
+.grid{display:grid;gap:16px;
+grid-template-columns:repeat(auto-fit,minmax(360px,1fr))}
+.card{background:rgba(15,20,40,.85);border:1px solid rgba(110,84,255,.2);
+border-radius:14px;padding:20px}
+.card-header{display:flex;justify-content:space-between;align-items:center;
+margin-bottom:12px;padding-bottom:10px;
+border-bottom:1px solid rgba(110,84,255,.15)}
+.card-title{color:#38bdf8;font-weight:600}
+.card-score{font-size:.8rem;padding:3px 10px;border-radius:10px;
+background:rgba(110,84,255,.15);color:#a78bfa;font-weight:700}
+.check{display:flex;gap:10px;padding:8px 10px;border-radius:6px;
+margin-bottom:4px;font-size:.85rem}
+.check.ok{background:rgba(94,224,192,.06);border-left:3px solid #5ee0c0}
+.check.warn{background:rgba(240,192,106,.06);border-left:3px solid #f0c06a}
+.check.err{background:rgba(240,106,106,.08);border-left:3px solid #f06a6a}
+.check.info{background:rgba(56,189,248,.05);border-left:3px solid #38bdf8}
+.check .i{font-weight:700;flex-shrink:0}
+.check.ok .i{color:#5ee0c0}
+.check.warn .i{color:#f0c06a}
+.check.err .i{color:#f06a6a}
+.check.info .i{color:#38bdf8}
+.check .m{flex:1;color:#cbd5e1}
+.fixes{background:linear-gradient(135deg,rgba(110,84,255,.08),rgba(56,189,248,.08));
+border:1px solid rgba(110,84,255,.3);border-radius:16px;
+padding:24px;margin-bottom:24px}
+.fixes h2{color:#a78bfa;margin-bottom:16px}
+.fix{padding:14px;background:rgba(0,0,0,.3);border-radius:10px;
+margin-bottom:10px;border-left:4px solid #a78bfa}
+.fix .msg{color:#cbd5e1;font-weight:600;margin-bottom:6px}
+.fix .desc{color:#94a3b8;font-size:.85rem;margin-bottom:6px}
+.fix .code{background:#000;color:#5ee0c0;padding:10px 14px;
+border-radius:6px;font-family:monospace;font-size:.8rem;
+overflow-x:auto;white-space:pre-wrap;word-break:break-all;
+border:1px solid rgba(94,224,192,.2)}
+.sev{display:inline-block;padding:2px 8px;border-radius:8px;
+font-size:.7rem;font-weight:700;text-transform:uppercase;margin-left:6px}
+.sev-critical{background:rgba(240,106,106,.2);color:#f06a6a}
+.sev-high{background:rgba(255,149,0,.2);color:#ff9500}
+.sev-medium{background:rgba(240,192,106,.2);color:#f0c06a}
+.sev-low{background:rgba(56,189,248,.2);color:#38bdf8}
+.error{display:none;padding:20px;background:rgba(240,106,106,.1);
+border:1px solid rgba(240,106,106,.4);border-radius:12px;
+color:#f06a6a;margin-bottom:20px;font-weight:600}
+.error.show{display:block}
+.footer{text-align:center;padding:30px;color:#64748b;font-size:.8rem;
+margin-top:30px;border-top:1px solid rgba(110,84,255,.1)}
+.footer strong{color:#a78bfa}
+@media(max-width:768px){.header h1{font-size:1.5rem}
+.grid{grid-template-columns:1fr}
+.input-row button{width:100%}}
+</style>
+</head>
+<body>
+<div class="container">
+<div class="header">
+<h1>🔍 NEXUS GITHUB ANALYZER</h1>
+<p>Analyse complète pour Eve, Slack Agents, Vercel</p>
+<div class="badge">PRO v4.0.1 · Aissa Mohammedi (DGK)</div>
+</div>
+<div class="form">
+<div class="input-row">
+<input type="text" id="repo" placeholder="https://github.com/user/repo" autocomplete="off">
+<button id="btn" onclick="analyze()">🚀 Analyser</button>
+</div>
+<div class="quick">
+<span>Exemples :</span>
+<a onclick="fill('https://github.com/vercel/next.js')">vercel/next.js</a>
+<a onclick="fill('https://github.com/microsoft/vscode')">microsoft/vscode</a>
+<a onclick="fill('https://github.com/facebook/react')">facebook/react</a>
+</div>
+</div>
+<div class="error" id="error"></div>
+<div class="loading" id="loading">
+<div class="spinner"></div>
+<p>Analyse en cours...</p>
+</div>
+<div class="score" id="score">
+<div class="score-value" id="scoreVal">0</div>
+<div class="score-label">Score global</div>
+<div class="score-stats">
+<div class="stat"><div class="n" id="statChecks">0</div><div class="l">Checks</div></div>
+<div class="stat"><div class="n" id="statIssues">0</div><div class="l">Erreurs</div></div>
+<div class="stat"><div class="n" id="statFixes">0</div><div class="l">Fixes</div></div>
+<div class="stat"><div class="n" id="statDuration">0s</div><div class="l">Durée</div></div>
+</div>
+</div>
+<div id="fixes"></div>
+<div class="grid" id="results"></div>
+<div class="footer">
+<strong>NEXUS GitHub Analyzer v4.0.1</strong><br>
+Aissa Mohammedi (DGK) · Code Nametron 3 Lara
+</div>
+</div>
+<script>
+function esc(s){
+if(typeof s!=='string')return String(s||'');
+return s.replace(/[&<>"']/g,function(m){
+return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m];
+});
+}
+function fill(u){document.getElementById('repo').value=u}
+function showErr(m){var e=document.getElementById('error');e.textContent='❌ '+m;e.classList.add('show')}
+function hideErr(){document.getElementById('error').classList.remove('show')}
+function analyze(){
+var url=document.getElementById('repo').value.trim();
+if(!url){alert('Entre une URL GitHub');return}
+var btn=document.getElementById('btn');
+btn.disabled=true;btn.textContent='⏳ Analyse...';
+hideErr();
+document.getElementById('loading').classList.add('show');
+document.getElementById('score').classList.remove('show');
+document.getElementById('results').innerHTML='';
+document.getElementById('fixes').innerHTML='';
+fetch('/api/analyze?repo='+encodeURIComponent(url))
+.then(function(r){return r.json()})
+.then(function(d){
+document.getElementById('loading').classList.remove('show');
+btn.disabled=false;btn.textContent='🚀 Analyser';
+if(d.error){showErr(d.error);return}
+render(d);
+})
+.catch(function(e){
+document.getElementById('loading').classList.remove('show');
+btn.disabled=false;btn.textContent='🚀 Analyser';
+showErr('Erreur réseau : '+e.message);
+});
+}
+function render(d){
+var s=d.global_score||0;
+var color=s>=80?'#5ee0c0':s>=60?'#38bdf8':s>=40?'#f0c06a':'#f06a6a';
+document.getElementById('scoreVal').textContent=s;
+document.getElementById('scoreVal').style.color=color;
+var totalChecks=0;
+(d.results||[]).forEach(function(r){totalChecks+=r.checks.length});
+document.getElementById('statChecks').textContent=totalChecks;
+document.getElementById('statIssues').textContent=d.total_issues||0;
+document.getElementById('statFixes').textContent=d.total_fixes||0;
+document.getElementById('statDuration').textContent=(d.duration_seconds||0).toFixed(1)+'s';
+document.getElementById('score').classList.add('show');
+if(d.fixes&&d.fixes.length>0){
+var h='<div class="fixes"><h2>🎯 FIXES PRIORITAIRES ('+d.fixes.length+')</h2>';
+d.fixes.forEach(function(f,i){
+var sev=f.severity||'medium';
+h+='<div class="fix"><div class="msg">'+(i+1)+'. '+esc(f.message)+'<span class="sev sev-'+sev+'">'+sev+'</span></div>';
+h+='<div class="desc">'+esc(f.fix)+'</div>';
+if(f.code)h+='<div class="code">'+esc(f.code)+'</div>';
+h+='</div>';
+});
+h+='</div>';
+document.getElementById('fixes').innerHTML=h;
+}
+var rh='';
+(d.results||[]).forEach(function(r){
+var ch='';
+r.checks.forEach(function(c){
+var i=c.status==='ok'?'✓':c.status==='warn'?'!':c.status==='err'?'✗':'i';
+ch+='<div class="check '+c.status+'"><span class="i">'+i+'</span><span class="m">'+esc(c.message)+'</span></div>';
+});
+rh+='<div class="card"><div class="card-header"><div class="card-title">'+esc(r.name)+'</div>';
+rh+='<div class="card-score">'+r.score+'/'+r.max_score+' ('+r.percent+'%)</div></div>'+ch+'</div>';
+});
+document.getElementById('results').innerHTML=rh;
+}
+document.getElementById('repo').addEventListener('keypress',function(e){
+if(e.key==='Enter')analyze();
+});
+</script>
+</body>
+</html>"""
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SECTION 8 — HTTP HANDLER
+# ═══════════════════════════════════════════════════════════════════════════
+
+class NexusHandler(BaseHTTPRequestHandler):
+def log_message(self, *args):
+pass
+
+def _send(self, status, body, ctype="text/html; charset=utf-8"):
+if isinstance(body, str):
+body = body.encode("utf-8")
+try:
+self.send_response(status)
+self.send_header("Content-Type", ctype)
+self.send_header("Content-Length", str(len(body)))
+self.send_header("Access-Control-Allow-Origin", "*")
+self.send_header("X-Powered-By", f"NexusAnalyzer/{VERSION}")
+self.end_headers()
+self.wfile.write(body)
+except Exception:
+pass
+
+def _json(self, data, status=200):
+self._send(status, json.dumps(data, ensure_ascii=False, default=str),
+"application/json; charset=utf-8")
+
+def do_GET(self):
+parsed = urllib.parse.urlparse(self.path)
+path = parsed.path
+query = urllib.parse.parse_qs(parsed.query)
+try:
+if path in ("/", "/index.html"):
+self._send(200, HTML_TEMPLATE)
+elif path == "/api/analyze":
+repo_raw = query.get("repo", [""])[0]
+if not repo_raw:
+self._json({"error": "Paramètre 'repo' requis"}, 400)
+return
+repo = extraire_repo(repo_raw)
+if "/" not in repo:
+self._json({"error": "URL invalide. Format : owner/repo"}, 400)
+return
+token = os.environ.get("GITHUB_TOKEN") or None
+try:
+analyzer = NexusAnalyzer(token=token)
+result = analyzer.analyze(repo, parallel=True)
+try:
+ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+rf = REPORTS_DIR / f"report_{repo.replace('/', '_')}_{ts}.json"
+with open(rf, "w", encoding="utf-8") as f:
+json.dump(result, f, indent=2, ensure_ascii=False)
+result["report_file"] = str(rf)
+except Exception:
+pass
+self._json(result, 200)
+except Exception as e:
+self._json({"error": f"Erreur analyse : {e}"}, 500)
+elif path == "/api/version":
+self._json({"version": VERSION, "author": AUTHOR,
+"protocole": PROTOCOLE, "build_date": BUILD_DATE})
+elif path == "/api/reports":
+reports = []
+try:
+for f in sorted(REPORTS_DIR.glob("*.json"), reverse=True)[:20]:
+reports.append({"name": f.name, "size": f.stat().st_size,
+"modified": datetime.fromtimestamp(f.stat().st_mtime).isoformat()})
+except Exception:
+pass
+self._json(reports, 200)
+elif path == "/health":
+self._json({"status": "ok", "version": VERSION,
+"author": AUTHOR, "protocole": PROTOCOLE}, 200)
+else:
+self._json({"error": "not found", "path": path}, 404)
+except Exception as e:
+self._json({"error": f"Erreur serveur : {e}"}, 500)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SECTION 9 — RÉSEAU
+# ═══════════════════════════════════════════════════════════════════════════
+
+def get_local_ip():
+try:
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.settimeout(2)
+s.connect(("8.8.8.8", 80))
+ip = s.getsockname()[0]
+s.close()
+return ip
+except Exception:
+return "127.0.0.1"
+
+
+def trouver_port_libre(port_depart, max_tentatives=None):
+if max_tentatives is None:
+max_tentatives = MAX_PORT_SCAN
+for p in range(port_depart, port_depart + max_tentatives):
+try:
+with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("0.0.0.0", p))
+return p
+except OSError:
+continue
+return None
+
+
+def ouvrir_navigateur(port):
+try:
+url = f"http://localhost:{port}/"
+threading.Thread(
+target=lambda: (time.sleep(1.5), webbrowser.open(url)),
+daemon=True).start()
+except Exception:
+pass
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SECTION 10 — BANNIÈRE
+# ═══════════════════════════════════════════════════════════════════════════
+
+def afficher_banniere(port, local_ip):
+print(f"""{C.M}{C.W}
+╔═══════════════════════════════════════════════════════════════════════════╗
+║ ║
+║ 🔍 NEXUS GITHUB ANALYZER PRO v{VERSION} ║
+║ ║
+║ Analyse complète : Eve, Slack Agents, Vercel, Next.js ║
+║ ║
+║ Auteur : {AUTHOR} ║
+║ Protocole : {PROTOCOLE} ║
+║ Build : {BUILD_DATE} ║
+║ ║
+╚═══════════════════════════════════════════════════════════════════════════╝{C.N}
+
+{C.W}🌐 Serveur HTTP :{C.N}
+{C.CY}→ Local :{C.N} http://localhost:{port}/
+{C.CY}→ Réseau :{C.N} http://{local_ip}:{port}/
+
+{C.W}📊 Endpoints API :{C.N}
+{C.CY}→ Health :{C.N} http://localhost:{port}/health
+{C.CY}→ Version :{C.N} http://localhost:{port}/api/version
+{C.CY}→ Reports :{C.N} http://localhost:{port}/api/reports
+
+{C.W}📊 12 vérifications :{C.N}
+✓ Dépôt · ✓ Structure · ✓ Lockfile · ✓ Engines
+✓ Env · ✓ Channel · ✓ Instructions · ✓ Tools
+✓ Manifest · ✓ Sécurité · ✓ Vercel · ✓ Complétude
+
+{C.W}📁 Rapports :{C.N} {REPORTS_DIR}/
+{C.W}📁 Logs :{C.N} {LOGS_DIR}/
+
+{C.Y}⏹ Ctrl+C pour arrêter proprement{C.N}
+""")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SECTION 11 — MAIN
+# ═══════════════════════════════════════════════════════════════════════════
+
+SERVER_INSTANCE = None
+SHUTDOWN_EVENT = threading.Event()
+
+
+def signal_handler(sig, frame):
+print(f"\n{C.Y}🛑 Signal reçu, arrêt propre...{C.N}")
+SHUTDOWN_EVENT.set()
+if SERVER_INSTANCE is not None:
+try:
+threading.Thread(target=SERVER_INSTANCE.shutdown, daemon=True).start()
+except Exception:
+pass
+
+
+def main():
+global SERVER_INSTANCE
+if sys.version_info < (3, 7):
+err(f"Python 3.7+ requis (actuel : {sys.version.split()[0]})")
+sys.exit(1)
+info(f"Python {sys.version.split()[0]} détecté")
+info(f"Dossier : {NEXUS_DIR}")
+for d in (NEXUS_DIR, REPORTS_DIR, CACHE_DIR, LOGS_DIR):
+if not d.exists():
+try:
+d.mkdir(parents=True, exist_ok=True)
+except Exception as e:
+warn(f"Impossible de créer {d} : {e}")
+ok(f"Rapports : {REPORTS_DIR}")
+ok(f"Logs : {LOGS_DIR}")
+import signal as _signal
+_signal.signal(_signal.SIGINT, signal_handler)
+_signal.signal(_signal.SIGTERM, signal_handler)
+port = trouver_port_libre(DEFAULT_PORT)
+if port is None:
+err(f"Aucun port libre trouvé entre {DEFAULT_PORT} et {DEFAULT_PORT + MAX_PORT_SCAN}")
+sys.exit(1)
+if port != DEFAULT_PORT:
+warn(f"Port {DEFAULT_PORT} occupé → port {port} utilisé")
+local_ip = get_local_ip()
+afficher_banniere(port, local_ip)
+log_to_file(f"Démarrage serveur sur port {port}", "INFO")
+try:
+SERVER_INSTANCE = ThreadingHTTPServer(("0.0.0.0", port), NexusHandler)
+SERVER_INSTANCE.daemon_threads = True
+SERVER_INSTANCE.allow_reuse_address = True
+except OSError as e:
+err(f"Impossible de démarrer le serveur : {e}")
+log_to_file(f"Erreur serveur : {e}", "ERROR")
+sys.exit(1)
+ouvrir_navigateur(port)
+ok(f"Serveur prêt. En attente de requêtes...")
+log_to_file("Serveur prêt", "INFO")
+try:
+SERVER_INSTANCE.serve_forever()
+except KeyboardInterrupt:
+pass
+finally:
+try:
+SERVER_INSTANCE.server_close()
+except Exception:
+pass
+print(f"\n{C.G}👋 NEXUS Analyzer arrêté proprement.{C.N}")
+log_to_file("Arrêt propre", "INFO")
+
+
+if __name__ == "__main__":
+main()
